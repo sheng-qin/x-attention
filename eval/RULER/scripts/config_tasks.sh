@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-NUM_SAMPLES=100
+NUM_SAMPLES=${NUM_SAMPLES_OVERRIDE:-100}
 REMOVE_NEWLINE_TAB=false
 STOP_WORDS=""
 
@@ -29,18 +29,22 @@ else
 fi
 
 # task name in `synthetic.yaml`
-synthetic=(
-    "niah_single_1"
-    "niah_single_2"
-    "niah_single_3"
-    "niah_multikey_1"
-    "niah_multikey_2"
-    "niah_multikey_3"
-    "niah_multivalue"
-    "niah_multiquery"
-    "vt"
-    "cwe"
-    "fwe"
-    "qa_1"
-    "qa_2"
-)
+if [ -n "${TASKS_OVERRIDE}" ]; then
+    IFS=',' read -r -a synthetic <<< "${TASKS_OVERRIDE}"
+else
+    synthetic=(
+        "niah_single_1"
+        "niah_single_2"
+        "niah_single_3"
+        "niah_multikey_1"
+        "niah_multikey_2"
+        "niah_multikey_3"
+        "niah_multivalue"
+        "niah_multiquery"
+        "vt"
+        "cwe"
+        "fwe"
+        "qa_1"
+        "qa_2"
+    )
+fi

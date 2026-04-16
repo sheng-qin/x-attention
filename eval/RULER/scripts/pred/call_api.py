@@ -260,13 +260,17 @@ def main():
     def get_output(idx_list, index_list, input_list, outputs_list, others_list, truncation_list, length_list):
         nonlocal llm
 
-        while True:
+        last_error = None
+        for _ in range(3):
             try:
                 with torch.no_grad():
                     pred_list = llm.process_batch(prompts=input_list)
                     break
             except Exception as e:
+                last_error = e
                 traceback.print_exc()
+        else:
+            raise RuntimeError(f"Failed to generate batch after 3 attempts: {last_error}") from last_error
 
         zipped_iter = zip(pred_list, idx_list, index_list, input_list,
                           outputs_list, others_list, truncation_list, length_list)

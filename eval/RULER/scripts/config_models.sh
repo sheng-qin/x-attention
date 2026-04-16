@@ -15,14 +15,29 @@
 TEMPERATURE="0.0" # greedy
 TOP_P="1.0"
 TOP_K="32"
-SEQ_LENGTHS=(
-    131072
-    65536
-    32768
-    16384
-    8192
-    4096
-)
+if [ -n "${SEQ_LENGTHS_OVERRIDE}" ]; then
+    IFS=',' read -r -a SEQ_LENGTHS <<< "${SEQ_LENGTHS_OVERRIDE}"
+else
+    SEQ_LENGTHS=(
+        131072
+        65536
+        32768
+        16384
+        8192
+        4096
+    )
+fi
+
+resolve_model_path() {
+    for candidate in "$@"; do
+        if [ -n "${candidate}" ] && [ -d "${candidate}" ]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    echo "$1"
+}
 
 MODEL_SELECT() {
     MODEL_NAME=$1
@@ -31,7 +46,10 @@ MODEL_SELECT() {
     
     case $MODEL_NAME in
         llama3.1-8b-chat)
-            MODEL_PATH="${MODEL_DIR}/Llama-3.1-8B-Instruct"
+            MODEL_PATH=$(resolve_model_path \
+                "${MODEL_DIR}/Meta-Llama-3.1-8B-Instruct" \
+                "${MODEL_DIR}/Llama-3.1-8B-Instruct" \
+                "${MODEL_DIR}")
             MODEL_TEMPLATE_TYPE="meta-llama3"
             MODEL_FRAMEWORK="hf"
             ;;

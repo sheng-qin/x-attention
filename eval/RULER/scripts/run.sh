@@ -16,11 +16,31 @@
 # container: docker.io/cphsieh/ruler:0.1.0
 # bash run.sh MODEL_NAME BENCHMARK_NAME
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+export PYTHONPATH="${SCRIPT_DIR}:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+TORCH_LIB_DIR="$("${PYTHON_BIN}" - <<'PY'
+import contextlib
+import os
+
+with contextlib.suppress(Exception):
+    import torch
+
+    print(os.path.join(os.path.dirname(torch.__file__), "lib"))
+PY
+)"
+if [ -n "${TORCH_LIB_DIR}" ] && [ -d "${TORCH_LIB_DIR}" ]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":${TORCH_LIB_DIR}:"*) ;;
+        *) export LD_LIBRARY_PATH="${TORCH_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+    esac
+fi
 
 # Root Directories
 GPUS="1" # GPU size for tensor_parallel.
 ROOT_DIR="benchmark_root" # the path that stores generated task samples and model predictions.
-MODEL_DIR="" # the path that contains individual model folders from Huggingface.
+MODEL_DIR="${MODEL_DIR:-/root/fshare/models/Llama3/Meta-Llama-3.1-8B-Instruct}" # the path that contains individual model folders from Huggingface.
 ENGINE_DIR="." # the path that contains individual engine folders from TensorRT-LLM.
 BATCH_SIZE=1  # increase to improve GPU utilization
 
@@ -32,6 +52,11 @@ MODEL_CONFIG=$(MODEL_SELECT ${MODEL_NAME} ${MODEL_DIR} ${ENGINE_DIR})
 IFS=":" read MODEL_PATH MODEL_TEMPLATE_TYPE MODEL_FRAMEWORK TOKENIZER_PATH TOKENIZER_TYPE OPENAI_API_KEY GEMINI_API_KEY AZURE_ID AZURE_SECRET AZURE_ENDPOINT <<< "$MODEL_CONFIG"
 if [ -z "${MODEL_PATH}" ]; then
     echo "Model: ${MODEL_NAME} is not supported"
+    exit 1
+fi
+
+if [ "${MODEL_FRAMEWORK}" == "hf" ] && [ ! -d "${MODEL_PATH}" ]; then
+    echo "Model path not found: ${MODEL_PATH}"
     exit 1
 fi
 
@@ -86,7 +111,7 @@ done
 
 # Start server (you may want to run in other container.)
 if [ "$MODEL_FRAMEWORK" == "vllm" ]; then
-    python pred/serve_vllm.py \
+    "${PYTHON_BIN}" pred/serve_vllm.py \
         --model=${MODEL_PATH} \
         --tensor-parallel-size=${GPUS} \
         --dtype bfloat16 \
@@ -94,12 +119,12 @@ if [ "$MODEL_FRAMEWORK" == "vllm" ]; then
         &
 
 elif [ "$MODEL_FRAMEWORK" == "trtllm" ]; then
-    python pred/serve_trt.py \
+    "${PYTHON_BIN}" pred/serve_trt.py \
         --model_path=${MODEL_PATH} \
         &
 
 elif [ "$MODEL_FRAMEWORK" == "sglang" ]; then
-    python -m sglang.launch_server \
+    "${PYTHON_BIN}" -m sglang.launch_server \
         --model-path ${MODEL_PATH} \
         --tp ${GPUS} \
         --port 5000 \
@@ -125,7 +150,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
     mkdir -p ${PRED_DIR}
     
     for TASK in "${TASKS[@]}"; do
-        python data/prepare.py \
+        "${PYTHON_BIN}" data/prepare.py \
             --save_dir ${DATA_DIR} \
             --benchmark ${BENCHMARK} \
             --task ${TASK} \
@@ -137,7 +162,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
             ${REMOVE_NEWLINE_TAB}
         
         start_time=$(date +%s)
-        python pred/call_api.py \
+        "${PYTHON_BIN}" pred/call_api.py \
             --data_dir ${DATA_DIR} \
             --save_dir ${PRED_DIR} \
             --benchmark ${BENCHMARK} \
@@ -158,7 +183,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
         total_time=$((total_time + time_diff))
     done
     
-    python eval/evaluate.py \
+    "${PYTHON_BIN}" eval/evaluate.py \
         --data_dir ${PRED_DIR} \
         --benchmark ${BENCHMARK}
 done

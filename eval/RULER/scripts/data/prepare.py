@@ -35,6 +35,7 @@ import argparse
 import importlib
 import subprocess
 import time
+import sys
 import yaml
 from pathlib import Path
 from template import Templates
@@ -109,7 +110,7 @@ def main():
         try:
             script = os.path.join(curr_folder, args.benchmark, f"{config['task']}.py")
             additional_args = " ".join([f"--{k} {v}" for k, v in config['args'].items()])
-            command = f"""python {script} \
+            command = f"""{sys.executable} {script} \
             --save_dir  {args.save_dir} \
             --save_name {args.task} \
             --subset {args.subset} \
@@ -140,6 +141,7 @@ def main():
                 print(result.stderr)
         except subprocess.CalledProcessError as e:
             print("Error output:", e.stderr)
+            raise
 
         print(f"Prepare {args.task} with lines: {args.num_samples} to {save_file}")
         print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")

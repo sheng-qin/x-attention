@@ -11,24 +11,92 @@ import flashinfer
 import time
 try:
     from xattn.src.Xattention import Xattention_prefill
-except:
+except Exception:
+    Xattention_prefill = None
     print("Xattention Import Fail")
 try:
     from xattn.src.Minference import Minference_prefill
-except:
+except Exception:
+    Minference_prefill = None
     print("Minference Prefill Import Fail")
 try:
     from xattn.src.Fullprefill import Full_prefill
-except:
+except Exception:
+    Full_prefill = None
     print("Full Prefill Import Fail")
 try:
     from xattn.src.Flexprefill import Flexprefill_prefill
-except:
+except Exception:
+    Flexprefill_prefill = None
     print("Flex Prefill Import Fail")
 from xattn.src.utils import *
 
 logger = logging.get_logger(__name__)
 
+
+def get_attention_metadata(attn_module):
+    config = attn_module.config
+    num_heads = getattr(attn_module, "num_heads", getattr(config, "num_attention_heads"))
+    num_key_value_heads = getattr(
+        attn_module,
+        "num_key_value_heads",
+        getattr(config, "num_key_value_heads", num_heads),
+    )
+    head_dim = getattr(
+        attn_module,
+        "head_dim",
+        getattr(config, "head_dim", config.hidden_size // num_heads),
+    )
+    return num_heads, num_key_value_heads, head_dim
+
+
+def resolve_past_key_value(past_key_value, kwargs):
+    return past_key_value if past_key_value is not None else kwargs.pop("past_key_values", None)
+
+
+def get_num_key_value_groups(attn_module):
+    config = attn_module.config
+    return getattr(
+        attn_module,
+        "num_key_value_groups",
+        getattr(config, "num_attention_heads") // getattr(config, "num_key_value_heads", getattr(config, "num_attention_heads")),
+    )
+
+
+def run_prefill_attention(self, query_states, key_states, value_states, attention_mask):
+    metric = self.fastprefillconfig.metric
+    stride = self.fastprefillconfig.stride
+
+    if metric == "flex" and Flexprefill_prefill is not None:
+        return Flexprefill_prefill(
+            query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2)
+        ).transpose(1, 2)
+
+    if metric == "xattn" and Xattention_prefill is not None:
+        threshold = self.fastprefillconfig.threshold
+        if isinstance(threshold, torch.Tensor):
+            threshold = threshold[self.layer_idx]
+        return Xattention_prefill(
+            query_states,
+            key_states,
+            value_states,
+            stride,
+            norm=1,
+            threshold=threshold,
+            use_triton=True,
+        )
+
+    if metric == "minfer" and Minference_prefill is not None:
+        return Minference_prefill(query_states, key_states, value_states, adaptive_budget=0.3)
+
+    if Full_prefill is None:
+        raise RuntimeError(f"Metric '{metric}' is unavailable and dense fallback is not installed.")
+
+    if metric != "full":
+        logger.warning_once(
+            f"Metric '{metric}' is unavailable in this environment; falling back to dense full attention."
+        )
+    return Full_prefill(query_states, key_states, value_states, attention_mask=attention_mask)
 
 
 def rotate_half(x):
@@ -116,14 +184,17 @@ def forward_eval(
         if self.fastprefillconfig.print_detail:
             start_time = time.time()
         bsz, q_len, _ = hidden_states.size()
+        num_heads, num_key_value_heads, head_dim = get_attention_metadata(self)
+        past_key_value = resolve_past_key_value(past_key_value, kwargs)
+        num_key_value_groups = get_num_key_value_groups(self)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         if self.fastprefillconfig.print_detail:
             torch.cuda.synchronize()
             reshape_time = time.time() - start_time
@@ -156,8 +227,8 @@ def forward_eval(
         _, _, q_len, _ = query_states.shape
         decoding = (q_len != k_len and q_len == 1)
         if not decoding:
-            key_states = repeat_kv(key_states, self.num_key_value_groups).to("cuda")
-            value_states = repeat_kv(value_states, self.num_key_value_groups).to("cuda")
+            key_states = repeat_kv(key_states, num_key_value_groups).to("cuda")
+            value_states = repeat_kv(value_states, num_key_value_groups).to("cuda")
         if self.fastprefillconfig.print_detail:
             torch.cuda.synchronize()
             past_kv_time = time.time() - start_time
@@ -166,19 +237,8 @@ def forward_eval(
         if self.fastprefillconfig.print_detail:
             start_time = time.time()
             print(f"q length: {q_len} k length: {k_len}")
-        stride = self.fastprefillconfig.stride
         if not decoding:
-            if self.fastprefillconfig.metric == "flex":
-                attn_output = Flexprefill_prefill(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2)).transpose(1, 2)
-            elif self.fastprefillconfig.metric == "xattn":
-                if isinstance(self.fastprefillconfig.threshold, torch.Tensor):
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold[self.layer_idx], use_triton=True)
-                else:
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold, use_triton=True)
-            elif self.fastprefillconfig.metric == "full":
-                attn_output = Full_prefill(query_states, key_states, value_states,attention_mask=attention_mask)
-            elif self.fastprefillconfig.metric == "minfer":
-                attn_output = Minference_prefill(query_states, key_states, value_states, adaptive_budget=0.3)
+            attn_output = run_prefill_attention(self, query_states, key_states, value_states, attention_mask)
         else:
             if key_states.device != query_states.device:
                 key_states = key_states.to(query_states.device)
@@ -203,9 +263,9 @@ def forward_eval(
 
         if self.fastprefillconfig.print_detail:
             start_time = time.time()
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, num_heads, q_len, head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, num_heads, q_len, head_dim)}, but is"
                 f" {attn_output.size()}"
             )
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -217,7 +277,7 @@ def forward_eval(
             post_attn_time = time.time() - start_time
             print(f"     Post-attention processing took: {post_attn_time:.6f} seconds")
 
-        return attn_output, None, past_key_value
+        return attn_output, None
 
 
 
@@ -330,14 +390,17 @@ def forward_to_save(
         if self.fastprefillconfig.print_detail:
             start_time = time.time()
         bsz, q_len, _ = hidden_states.size()
+        num_heads, num_key_value_heads, head_dim = get_attention_metadata(self)
+        past_key_value = resolve_past_key_value(past_key_value, kwargs)
+        num_key_value_groups = get_num_key_value_groups(self)
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, head_dim).transpose(1, 2)
         if self.fastprefillconfig.print_detail:
             torch.cuda.synchronize()
             reshape_time = time.time() - start_time
@@ -370,8 +433,8 @@ def forward_to_save(
         _, _, q_len, _ = query_states.shape
         decoding = (q_len != k_len and q_len == 1)
         if not decoding:
-            key_states = repeat_kv(key_states, self.num_key_value_groups).to("cuda")
-            value_states = repeat_kv(value_states, self.num_key_value_groups).to("cuda")
+            key_states = repeat_kv(key_states, num_key_value_groups).to("cuda")
+            value_states = repeat_kv(value_states, num_key_value_groups).to("cuda")
         if self.fastprefillconfig.print_detail:
             torch.cuda.synchronize()
             past_kv_time = time.time() - start_time
@@ -380,19 +443,8 @@ def forward_to_save(
         if self.fastprefillconfig.print_detail:
             start_time = time.time()
             print(f"q length: {q_len} k length: {k_len}")
-        stride = self.fastprefillconfig.stride
         if not decoding:
-            if self.fastprefillconfig.metric == "flex":
-                attn_output = Flexprefill_prefill(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2)).transpose(1, 2)
-            elif self.fastprefillconfig.metric == "xattn":
-                if isinstance(self.fastprefillconfig.threshold, torch.Tensor):
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold[self.layer_idx], use_triton=True)
-                else:
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold, use_triton=True)
-            elif self.fastprefillconfig.metric == "full":
-                attn_output = Full_prefill(query_states, key_states, value_states,attention_mask=attention_mask)
-            elif self.fastprefillconfig.metric == "minfer":
-                attn_output = Minference_prefill(query_states, key_states, value_states, adaptive_budget=0.3)
+            attn_output = run_prefill_attention(self, query_states, key_states, value_states, attention_mask)
         else:
             if key_states.device != query_states.device:
                 key_states = key_states.to(query_states.device)
@@ -433,9 +485,9 @@ def forward_to_save(
 
         if self.fastprefillconfig.print_detail:
             start_time = time.time()
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, num_heads, q_len, head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, num_heads, q_len, head_dim)}, but is"
                 f" {attn_output.size()}"
             )
         attn_output = attn_output.transpose(1, 2).contiguous()
@@ -447,7 +499,7 @@ def forward_to_save(
             post_attn_time = time.time() - start_time
             print(f"     Post-attention processing took: {post_attn_time:.6f} seconds")
 
-        return attn_output, None, past_key_value
+        return attn_output, None
 
 def load_fake_model(layer_to_save,target_len,name_or_path=""):
     model = LlamaForCausalLM.from_pretrained(
