@@ -10,6 +10,138 @@ from xattn.src.kernels import (
 from block_sparse_attn import block_sparse_attn_func
 
 
+def finalize_prefill_simple_masks(
+    simple_masks: torch.Tensor,
+    q_block_num: int,
+    num_kv_head: int,
+    causal: bool,
+    keep_sink: bool,
+    keep_recent: bool,
+) -> torch.Tensor:
+    if causal:
+        simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
+            torch.tril(
+                torch.ones(
+                    q_block_num, q_block_num, dtype=bool, device=simple_masks.device
+                ),
+                diagonal=0,
+            ),
+            simple_masks[:, :, -q_block_num:, -q_block_num:],
+            False,
+        )
+    if keep_sink:
+        simple_masks[:, :, 0, :] = True
+    if keep_recent:
+        eye_matrix = torch.eye(q_block_num, device=simple_masks.device, dtype=bool)
+        eye_matrix_expanded = (
+            eye_matrix.unsqueeze(0)
+            .unsqueeze(0)
+            .expand(1, num_kv_head, q_block_num, q_block_num)
+        )
+        simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
+            eye_matrix_expanded, True, simple_masks[:, :, -q_block_num:, -q_block_num:]
+        )
+    return simple_masks
+
+
+def mean_pool_by_block(hidden_states: torch.Tensor, block_size: int) -> torch.Tensor:
+    batch_size, head_num, seq_len, head_dim = hidden_states.shape
+    block_num = (seq_len + block_size - 1) // block_size
+    num_to_pad = block_num * block_size - seq_len
+    if num_to_pad > 0:
+        padded_states = F.pad(hidden_states, (0, 0, 0, num_to_pad), value=0)
+    else:
+        padded_states = hidden_states
+
+    valid_mask = hidden_states.new_ones((1, 1, seq_len, 1))
+    if num_to_pad > 0:
+        valid_mask = F.pad(valid_mask, (0, 0, 0, num_to_pad), value=0)
+
+    padded_states = padded_states.view(batch_size, head_num, block_num, block_size, head_dim)
+    valid_mask = valid_mask.view(1, 1, block_num, block_size, 1)
+    pooled_states = (padded_states * valid_mask).sum(dim=3)
+    pooled_states = pooled_states / valid_mask.sum(dim=3).clamp_min(1)
+    return pooled_states
+
+
+def block_mean_estimate(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    block_size,
+    norm=1,
+    threshold=0.9,
+    chunk_size=16384,
+    causal=True,
+    keep_sink=False,
+    keep_recent=False,
+) -> torch.Tensor:
+    batch_size, num_kv_head, k_len, head_dim = key_states.shape
+    batch_size, num_q_head, q_len, head_dim = query_states.shape
+    assert num_q_head == num_kv_head
+
+    q_block_num = (q_len + block_size - 1) // block_size
+    k_block_num = (k_len + block_size - 1) // block_size
+    assert k_block_num >= q_block_num
+
+    num_blocks_per_chunk = max(chunk_size // block_size, 1)
+    q_chunk_num = (q_block_num + num_blocks_per_chunk - 1) // num_blocks_per_chunk
+    offset_block_num = k_block_num - q_block_num
+
+    pooled_query_states = mean_pool_by_block(query_states, block_size)
+    pooled_key_states = mean_pool_by_block(key_states, block_size)
+
+    key_positions = torch.arange(k_block_num, device=query_states.device)
+    attn_sum_list = []
+    simple_mask_list = []
+
+    for chunk_idx in range(q_chunk_num):
+        q_start = chunk_idx * num_blocks_per_chunk
+        q_end = min(q_start + num_blocks_per_chunk, q_block_num)
+        chunked_query = pooled_query_states[:, :, q_start:q_end, :]
+        attn_sum = torch.matmul(
+            chunked_query,
+            pooled_key_states.transpose(2, 3),
+        )
+        attn_sum = attn_sum / math.sqrt(head_dim) / norm
+
+        if causal:
+            query_positions = offset_block_num + torch.arange(
+                q_start, q_end, device=query_states.device
+            )
+            causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+            attn_sum = attn_sum.masked_fill(
+                causal_mask.unsqueeze(0).unsqueeze(0),
+                float("-inf"),
+            )
+
+        attn_sum = F.softmax(attn_sum, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_sum = F.dropout(attn_sum, p=0, training=False)
+        current_index = offset_block_num + q_start
+        simple_mask = find_blocks_chunked(
+            attn_sum,
+            current_index,
+            threshold,
+            None,
+            decoding=False,
+            mode="prefill",
+            causal=causal,
+        )
+        attn_sum_list.append(attn_sum)
+        simple_mask_list.append(simple_mask)
+
+    attn_sums = torch.cat(attn_sum_list, dim=-2)
+    simple_masks = torch.cat(simple_mask_list, dim=-2)
+    simple_masks = finalize_prefill_simple_masks(
+        simple_masks,
+        q_block_num=q_block_num,
+        num_kv_head=num_kv_head,
+        causal=causal,
+        keep_sink=keep_sink,
+        keep_recent=keep_recent,
+    )
+    return attn_sums, simple_masks
+
+
 def xattn_estimate(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -25,10 +157,24 @@ def xattn_estimate(
     kdb: int = 1,
     keep_sink=False,
     keep_recent=False,
+    block_mean_score=False,
 ) -> torch.Tensor:
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
     batch_size, num_q_head, q_len, head_dim = query_states.shape
     assert num_q_head == num_kv_head
+
+    if block_mean_score:
+        return block_mean_estimate(
+            query_states,
+            key_states,
+            block_size=block_size,
+            norm=norm,
+            threshold=threshold,
+            chunk_size=chunk_size,
+            causal=causal,
+            keep_sink=keep_sink,
+            keep_recent=keep_recent,
+        )
 
     k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
     q_num_to_pad = ((q_len + chunk_size - 1) // chunk_size) * chunk_size - q_len
@@ -271,30 +417,14 @@ def xattn_estimate(
         del reshaped_query, reshaped_key
     attn_sums = torch.cat(attn_sum_list, dim=-2)
     simple_masks = torch.cat(simple_mask_list, dim=-2)
-
-    if causal:
-        simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
-            torch.tril(
-                torch.ones(
-                    q_block_num, q_block_num, dtype=bool, device=key_states.device
-                ),
-                diagonal=0,
-            ),
-            simple_masks[:, :, -q_block_num:, -q_block_num:],
-            False,
-        )
-    if keep_sink:
-        simple_masks[:, :, 0, :] = True
-    if keep_recent:
-        eye_matrix = torch.eye(q_block_num, device=simple_masks.device, dtype=bool)
-        eye_matrix_expanded = (
-            eye_matrix.unsqueeze(0)
-            .unsqueeze(0)
-            .expand(1, num_kv_head, q_block_num, q_block_num)
-        )
-        simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
-            eye_matrix_expanded, True, simple_masks[:, :, -q_block_num:, -q_block_num:]
-        )
+    simple_masks = finalize_prefill_simple_masks(
+        simple_masks,
+        q_block_num=q_block_num,
+        num_kv_head=num_kv_head,
+        causal=causal,
+        keep_sink=keep_sink,
+        keep_recent=keep_recent,
+    )
 
     return attn_sums, simple_masks
 
@@ -313,6 +443,7 @@ def Xattention_prefill(
     chunk_size=None,
     keep_sink=False,
     keep_recent=False,
+    block_mean_score=False,
 ):
     batch_size, num_heads, k_len, head_dim = key_states.shape
     _, _, q_len, _ = query_states.shape
@@ -343,6 +474,7 @@ def Xattention_prefill(
         kdb=kdb,
         keep_sink=keep_sink,
         keep_recent=keep_recent,
+        block_mean_score=block_mean_score,
     )
 
     if query_states.device != key_states.device:

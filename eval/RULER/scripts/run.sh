@@ -82,6 +82,7 @@ METIRC=${METRIC:-"--metric xattn"} # Default: xattn
 PRINT_DETAIL=${PRINT_DETAIL:-""}
 STRIDE=${STRIDE:-""}
 THRESHOLD=${THRESHOLD:-""}
+BLOCK_MEAN_SCORE=${BLOCK_MEAN_SCORE:-""}
 
 shift 2 # Remove MODEL_NAME and BENCHMARK
 while [[ $# -gt 0 ]]; do
@@ -101,6 +102,10 @@ while [[ $# -gt 0 ]]; do
         --stride)
             STRIDE="--stride $2"
             shift 2
+            ;;
+        --block_mean_score)
+            BLOCK_MEAN_SCORE="--block_mean_score"
+            shift
             ;;
         *)
             echo "Unknown option: $1"
@@ -142,6 +147,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
     if [[ -n ${METRIC} ]]; then SETTINGS_INFO+="${METRIC#--metric }_"; fi
     if [[ -n ${STRIDE} ]]; then SETTINGS_INFO+="fuse_${STRIDE##* }_"; fi
     if [[ -n ${THRESHOLD} && -z ${PRECISE_THRESHOLD} ]]; then SETTINGS_INFO+="thresh_${THRESHOLD#--threshold }_"; fi
+    if [[ -n ${BLOCK_MEAN_SCORE} ]]; then SETTINGS_INFO+="blockmean_"; fi
     
     RESULTS_DIR="${ROOT_DIR}/${SETTINGS_INFO}${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}"
     DATA_DIR="${RESULTS_DIR}/data"
@@ -177,7 +183,8 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
             ${METRIC} \
             ${THRESHOLD} \
             ${STRIDE} \
-            ${PRINT_DETAIL}
+            ${PRINT_DETAIL} \
+            ${BLOCK_MEAN_SCORE}
         end_time=$(date +%s)
         time_diff=$((end_time - start_time))
         total_time=$((total_time + time_diff))

@@ -66,6 +66,7 @@ def get_num_key_value_groups(attn_module):
 def run_prefill_attention(self, query_states, key_states, value_states, attention_mask):
     metric = self.fastprefillconfig.metric
     stride = self.fastprefillconfig.stride
+    block_mean_score = self.fastprefillconfig.block_mean_score
 
     if metric == "flex" and Flexprefill_prefill is not None:
         return Flexprefill_prefill(
@@ -84,6 +85,7 @@ def run_prefill_attention(self, query_states, key_states, value_states, attentio
             norm=1,
             threshold=threshold,
             use_triton=True,
+            block_mean_score=block_mean_score,
         )
 
     if metric == "minfer" and Minference_prefill is not None:
@@ -291,6 +293,7 @@ class FastPrefillConfig(dict):
         - print_detail (bool): Whether to print detailed timing and debugging information.
         - stride (int): Determines the level of fused attention computation (e.g., 16, 8, or 4).
         - metric (str): Defines the type of prefill mechanism used ('xattn', 'full', 'minfer', 'flex').
+        - block_mean_score (bool): Whether to use block-mean pooling for approximate qk score estimation.
 
         Methods:
         - __init__: Initializes the configuration with user-defined or default values.
@@ -301,7 +304,8 @@ class FastPrefillConfig(dict):
         threshold:float=None,
         print_detail:bool=False,
         stride = 16,
-        metric = "xattn"
+        metric = "xattn",
+        block_mean_score:bool=False,
     ):
         """
         Initialize the configuration with default or user-provided values.
@@ -310,6 +314,7 @@ class FastPrefillConfig(dict):
         self.print_detail = print_detail
         self.metric = metric
         self.stride = stride
+        self.block_mean_score = block_mean_score
         if threshold is not None:
             self.threshold = torch.ones((32,32)).to("cuda")*threshold
         else:
