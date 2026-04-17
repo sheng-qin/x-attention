@@ -7,7 +7,64 @@ from xattn.src.kernels import (
     softmax_fuse_block_sum,
     flat_group_gemm_fuse_reshape,
 )
-from block_sparse_attn import block_sparse_attn_func
+from block_sparse_attn.block_sparse_attn_interface import BlockSparseAttnFunc, replace_ones_with_count
+
+
+_WARNED_ESTIMATE_FALLBACKS = set()
+
+
+def warn_estimate_fallback_once(key: str, message: str):
+    if key not in _WARNED_ESTIMATE_FALLBACKS:
+        print(message)
+        _WARNED_ESTIMATE_FALLBACKS.add(key)
+
+
+def configurable_block_sparse_attn_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    head_mask_type,
+    streaming_info,
+    base_blockmask,
+    max_seqlen_q_,
+    max_seqlen_k_,
+    block_size,
+    p_dropout,
+    deterministic=False,
+    softmax_scale=None,
+    is_causal=False,
+    exact_streaming=False,
+    return_attn_probs=False,
+):
+    head_mask_type, blocksparse_head_num = replace_ones_with_count(head_mask_type)
+    if base_blockmask is not None:
+        assert base_blockmask.shape[1] == blocksparse_head_num
+
+    return BlockSparseAttnFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        block_size,
+        block_size,
+        head_mask_type,
+        streaming_info,
+        base_blockmask,
+        max_seqlen_q_,
+        max_seqlen_k_,
+        p_dropout,
+        softmax_scale,
+        is_causal,
+        exact_streaming,
+        return_attn_probs,
+        -1,
+        -1,
+        deterministic,
+        torch.is_grad_enabled(),
+    )
 
 
 def finalize_prefill_simple_masks(
@@ -169,6 +226,12 @@ def xattn_estimate(
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
     batch_size, num_q_head, q_len, head_dim = query_states.shape
     assert num_q_head == num_kv_head
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    if block_size % stride != 0:
+        raise ValueError(f"block_size ({block_size}) must be divisible by stride ({stride})")
 
     if block_mean_score:
         return block_mean_estimate(
@@ -224,6 +287,18 @@ def xattn_estimate(
     k_reshaped_seq_len = (k_len + k_num_to_pad) // stride
     q_reshaped_num_to_pad = q_num_to_pad // stride
     num_blocks_per_chunk = reshaped_chunk_size // reshaped_block_size
+    if use_triton and block_size != 128:
+        warn_estimate_fallback_once(
+            f"block_size_{block_size}",
+            f"XAttention: block_size={block_size} is not enabled for Triton estimation; falling back to non-Triton estimate path.",
+        )
+        use_triton = False
+    if use_triton and reshaped_chunk_size % 128 != 0:
+        warn_estimate_fallback_once(
+            f"chunk_size_{chunk_size}_stride_{stride}",
+            f"XAttention: chunk_size={chunk_size} with stride={stride} is incompatible with Triton estimation; falling back to non-Triton estimate path.",
+        )
+        use_triton = False
     if not use_triton:
         if select_mode == "random":
             perm_idx = torch.randperm(stride)
@@ -502,7 +577,6 @@ def Xattention_prefill(
         approx_simple_mask = approx_simple_mask.to(query_states.device)
 
     ####################
-    assert block_size == 128
     assert batch_size == 1
     query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
     key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
@@ -524,7 +598,7 @@ def Xattention_prefill(
     assert approx_simple_mask.device == query_states.device
     active_simple_mask = approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous()
 
-    attn_output = block_sparse_attn_func(
+    attn_output = configurable_block_sparse_attn_func(
         query_states,
         key_states,
         value_states,
@@ -535,6 +609,7 @@ def Xattention_prefill(
         active_simple_mask,
         q_len,
         k_len,
+        block_size=block_size,
         p_dropout=0.0,
         deterministic=True,
         is_causal=causal,

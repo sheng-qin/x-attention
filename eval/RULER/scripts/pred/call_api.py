@@ -95,6 +95,7 @@ parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--threshold", type=float, default=None, help="Threshold for grouping.")
 parser.add_argument("--print_detail", action='store_true', default=False, help="Print detailed information. Default is False.")
 parser.add_argument("--stride", type=int, default=16, help="Small block size") 
+parser.add_argument("--block_size", type=int, default=128, help="Attention block size for block mask construction and sparse kernel tiling.")
 parser.add_argument("--metric", type=str, default="xattn", help="")
 parser.add_argument(
     "--block_mean_score",
@@ -133,6 +134,7 @@ fastprefillconfig = FastPrefillConfig(
     threshold=args.threshold,
     print_detail=args.print_detail,
     stride = args.stride,
+    block_size=args.block_size,
     metric=args.metric,
     block_mean_score=args.block_mean_score,
     retention_policy=args.retention_policy,

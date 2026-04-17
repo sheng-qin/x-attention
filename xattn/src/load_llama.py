@@ -66,6 +66,7 @@ def get_num_key_value_groups(attn_module):
 def run_prefill_attention(self, query_states, key_states, value_states, attention_mask):
     metric = self.fastprefillconfig.metric
     stride = self.fastprefillconfig.stride
+    block_size = self.fastprefillconfig.block_size
     block_mean_score = self.fastprefillconfig.block_mean_score
     retention_policy = self.fastprefillconfig.retention_policy
     retention_ratio = self.fastprefillconfig.retention_ratio
@@ -87,6 +88,7 @@ def run_prefill_attention(self, query_states, key_states, value_states, attentio
             stride,
             norm=1,
             threshold=threshold,
+            block_size=block_size,
             use_triton=True,
             block_mean_score=block_mean_score,
             retention_policy=retention_policy,
@@ -298,6 +300,7 @@ class FastPrefillConfig(dict):
         - threshold (float or torch.Tensor, optional): The threshold for selecting relevant attention blocks.
         - print_detail (bool): Whether to print detailed timing and debugging information.
         - stride (int): Determines the level of fused attention computation (e.g., 16, 8, or 4).
+        - block_size (int): The attention block size used by the estimator and final sparse kernel.
         - metric (str): Defines the type of prefill mechanism used ('xattn', 'full', 'minfer', 'flex').
         - block_mean_score (bool): Whether to use block-mean pooling for approximate qk score estimation.
         - retention_policy (str): The approximate block retention policy ('threshold', 'ratio', or 'topk').
@@ -313,6 +316,7 @@ class FastPrefillConfig(dict):
         threshold:float=None,
         print_detail:bool=False,
         stride = 16,
+        block_size:int=128,
         metric = "xattn",
         block_mean_score:bool=False,
         retention_policy:str="threshold",
@@ -326,10 +330,17 @@ class FastPrefillConfig(dict):
         self.print_detail = print_detail
         self.metric = metric
         self.stride = stride
+        self.block_size = block_size
         self.block_mean_score = block_mean_score
         self.retention_policy = retention_policy
         self.retention_ratio = retention_ratio
         self.retention_topk = retention_topk
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        if stride <= 0:
+            raise ValueError("stride must be positive")
+        if block_size % stride != 0:
+            raise ValueError("block_size must be divisible by stride")
         if retention_policy not in {"threshold", "ratio", "topk"}:
             raise ValueError(f"Unsupported retention policy: {retention_policy}")
         if retention_policy == "ratio":

@@ -81,6 +81,7 @@ fi
 METIRC=${METRIC:-"--metric xattn"} # Default: xattn
 PRINT_DETAIL=${PRINT_DETAIL:-""}
 STRIDE=${STRIDE:-""}
+BLOCK_SIZE=${BLOCK_SIZE:-""}
 THRESHOLD=${THRESHOLD:-""}
 BLOCK_MEAN_SCORE=${BLOCK_MEAN_SCORE:-""}
 RETENTION_POLICY=${RETENTION_POLICY:-""}
@@ -104,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --stride)
             STRIDE="--stride $2"
+            shift 2
+            ;;
+        --block_size)
+            BLOCK_SIZE="--block_size $2"
             shift 2
             ;;
         --block_mean_score)
@@ -161,6 +166,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
     SETTINGS_INFO=""
     if [[ -n ${METRIC} ]]; then SETTINGS_INFO+="${METRIC#--metric }_"; fi
     if [[ -n ${STRIDE} ]]; then SETTINGS_INFO+="fuse_${STRIDE##* }_"; fi
+    if [[ -n ${BLOCK_SIZE} ]]; then SETTINGS_INFO+="block_${BLOCK_SIZE#--block_size }_"; fi
     if [[ -n ${THRESHOLD} && -z ${PRECISE_THRESHOLD} ]]; then SETTINGS_INFO+="thresh_${THRESHOLD#--threshold }_"; fi
     if [[ -n ${BLOCK_MEAN_SCORE} ]]; then SETTINGS_INFO+="blockmean_"; fi
     if [[ -n ${RETENTION_POLICY} && ${RETENTION_POLICY#--retention_policy } != "threshold" ]]; then SETTINGS_INFO+="${RETENTION_POLICY#--retention_policy }_"; fi
@@ -201,6 +207,7 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
             ${METRIC} \
             ${THRESHOLD} \
             ${STRIDE} \
+            ${BLOCK_SIZE} \
             ${PRINT_DETAIL} \
             ${BLOCK_MEAN_SCORE} \
             ${RETENTION_POLICY} \
