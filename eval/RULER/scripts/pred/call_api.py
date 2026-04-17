@@ -102,6 +102,25 @@ parser.add_argument(
     default=False,
     help="Use block-mean pooling for approximate qk score estimation.",
 )
+parser.add_argument(
+    "--retention_policy",
+    type=str,
+    default="threshold",
+    choices=("threshold", "ratio", "topk"),
+    help="Approximate block retention policy.",
+)
+parser.add_argument(
+    "--retention_ratio",
+    type=float,
+    default=None,
+    help="Row-wise retained ratio for the ratio retention policy.",
+)
+parser.add_argument(
+    "--retention_topk",
+    type=int,
+    default=None,
+    help="Row-wise retained block count for the topk retention policy.",
+)
 
 
 
@@ -116,6 +135,9 @@ fastprefillconfig = FastPrefillConfig(
     stride = args.stride,
     metric=args.metric,
     block_mean_score=args.block_mean_score,
+    retention_policy=args.retention_policy,
+    retention_ratio=args.retention_ratio,
+    retention_topk=args.retention_topk,
 )
 
 def get_llm(tokens_to_generate):

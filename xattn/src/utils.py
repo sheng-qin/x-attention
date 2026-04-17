@@ -41,18 +41,64 @@ def create_causal_mask(batch_size, head_num, block_size, block_num, divide_block
     mask = mask.expand(batch_size, head_num, block_size, total_size)
     return mask
 
+
+def build_prefill_forced_mask(batch_size, head_num, chunk_num, block_num, current_index, device, causal):
+    mask = torch.zeros(
+        (batch_size, head_num, chunk_num, block_num), dtype=torch.bool, device=device
+    )
+    if causal:
+        mask[:, :, :, 0] = True
+        mask[:, :, :, current_index : current_index + chunk_num] = torch.eye(
+            chunk_num, dtype=torch.bool, device=device
+        ).unsqueeze(0).unsqueeze(0).expand(1, head_num, chunk_num, chunk_num)
+    return mask
+
+
+def scatter_prefill_keep_indices(mask, index, index_mask):
+    batch_size, head_num, chunk_num, block_num = mask.shape
+    flat_mask = mask.view(batch_size, head_num * chunk_num, block_num)
+    flat_index = index.view(batch_size, head_num * chunk_num, block_num)
+    flat_index_mask = index_mask.view(batch_size, head_num * chunk_num, block_num)
+    batch_ids = torch.arange(batch_size, device=mask.device).view(batch_size, 1, 1)
+    row_ids = torch.arange(flat_mask.shape[1], device=mask.device).view(1, flat_mask.shape[1], 1)
+    flat_mask[
+        batch_ids.expand_as(flat_index_mask)[flat_index_mask],
+        row_ids.expand_as(flat_index_mask)[flat_index_mask],
+        flat_index[flat_index_mask],
+    ] = True
+    return flat_mask.view(batch_size, head_num, chunk_num, block_num)
+
+
+def build_prefill_selectable_mask(mask, block_num, current_index, chunk_num, causal):
+    selectable_mask = ~mask
+    if causal:
+        block_positions = torch.arange(block_num, device=mask.device).view(1, 1, 1, block_num)
+        row_positions = current_index + torch.arange(
+            chunk_num, device=mask.device
+        ).view(1, 1, chunk_num, 1)
+        selectable_mask = selectable_mask & (block_positions <= row_positions)
+    return selectable_mask
+
 def find_blocks_chunked(
-    input_tensor, current_index, threshold, num_to_choose, decoding: bool, mode: str = "both", causal=True
+    input_tensor,
+    current_index,
+    threshold,
+    num_to_choose,
+    decoding: bool,
+    mode: str = "both",
+    causal=True,
+    retention_ratio=None,
 ):
     """
         Finds and selects relevant blocks of attention for transformer-based models based on a 
-        threshold or a predefined number of blocks.
+        threshold, a fixed ratio, or a predefined number of blocks.
 
         Parameters:
         - input_tensor (torch.Tensor): The input tensor of shape (batch_size, head_num, chunk_num, block_num).
         - current_index (int): The current index in the sequence processing.
         - threshold (float or None): A threshold value used to determine the minimum attention weight sum.
         - num_to_choose (int or None): The number of blocks to be selected, ensuring sufficient information retrieval.
+        - retention_ratio (float or None): The row-wise retained ratio used when ratio retention is enabled.
         - decoding (bool): If True, operates in decoding mode; otherwise, it's in encoding mode.
         - mode (str): Defines the processing mode, either 'both', 'prefill', or 'decode'.
         - causal (bool): If True, applies causal masking to prevent future information leakage.
@@ -61,7 +107,7 @@ def find_blocks_chunked(
         - torch.Tensor: A boolean mask of shape (batch_size, head_num, chunk_num, block_num),
         indicating which blocks should be attended to.
     """
-    assert threshold is None or num_to_choose is None
+    assert sum(option is not None for option in (threshold, num_to_choose, retention_ratio)) == 1
     batch_size, head_num, chunk_num, block_num = input_tensor.shape
     # 0 -- -- -- -- current_index
     # 0 -- -- -- -- -- current_index+1
@@ -96,13 +142,8 @@ def find_blocks_chunked(
         else:
             required_sum = total_sum * threshold
         if causal:
-            mask = torch.zeros_like(input_tensor, dtype=torch.bool)
-            mask[:, :, :, 0] = 1
-            mask[:, :, :, current_index : current_index + chunk_num] = (
-                torch.eye(chunk_num, device=mask.device)
-                .unsqueeze(0)
-                .unsqueeze(0)
-                .expand(1, head_num, chunk_num, chunk_num)
+            mask = build_prefill_forced_mask(
+                batch_size, head_num, chunk_num, block_num, current_index, input_tensor.device, causal
             )
             other_values = input_tensor.masked_fill(
                 mask, 0
@@ -170,6 +211,27 @@ def find_blocks_chunked(
                 index,
             ] = True
             mask = mask.view(batch_size, head_num, chunk_num, block_num)
+    elif num_to_choose is not None or retention_ratio is not None:
+        mask = build_prefill_forced_mask(
+            batch_size, head_num, chunk_num, block_num, current_index, input_tensor.device, causal
+        )
+        selectable_mask = build_prefill_selectable_mask(
+            mask, block_num, current_index, chunk_num, causal
+        )
+        candidate_count = selectable_mask.sum(dim=-1)
+        if num_to_choose is not None:
+            keep_count = torch.full_like(candidate_count, num_to_choose)
+        else:
+            keep_count = torch.ceil(
+                candidate_count.to(torch.float32) * retention_ratio
+            ).to(torch.int64)
+        keep_count = torch.minimum(keep_count, candidate_count)
+        ranked_values = input_tensor.masked_fill(~selectable_mask, float("-inf"))
+        _, index = torch.sort(ranked_values, dim=-1, descending=True)
+        index_mask = torch.arange(block_num, device=input_tensor.device).view(
+            1, 1, 1, block_num
+        ) < keep_count.unsqueeze(dim=-1)
+        mask = scatter_prefill_keep_indices(mask, index, index_mask)
     else:
         raise NotImplementedError("block num chunk prefill not impleted")
     

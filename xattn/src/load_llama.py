@@ -67,6 +67,9 @@ def run_prefill_attention(self, query_states, key_states, value_states, attentio
     metric = self.fastprefillconfig.metric
     stride = self.fastprefillconfig.stride
     block_mean_score = self.fastprefillconfig.block_mean_score
+    retention_policy = self.fastprefillconfig.retention_policy
+    retention_ratio = self.fastprefillconfig.retention_ratio
+    retention_topk = self.fastprefillconfig.retention_topk
 
     if metric == "flex" and Flexprefill_prefill is not None:
         return Flexprefill_prefill(
@@ -86,6 +89,9 @@ def run_prefill_attention(self, query_states, key_states, value_states, attentio
             threshold=threshold,
             use_triton=True,
             block_mean_score=block_mean_score,
+            retention_policy=retention_policy,
+            retention_ratio=retention_ratio,
+            retention_topk=retention_topk,
         )
 
     if metric == "minfer" and Minference_prefill is not None:
@@ -294,6 +300,9 @@ class FastPrefillConfig(dict):
         - stride (int): Determines the level of fused attention computation (e.g., 16, 8, or 4).
         - metric (str): Defines the type of prefill mechanism used ('xattn', 'full', 'minfer', 'flex').
         - block_mean_score (bool): Whether to use block-mean pooling for approximate qk score estimation.
+        - retention_policy (str): The approximate block retention policy ('threshold', 'ratio', or 'topk').
+        - retention_ratio (float, optional): The row-wise kept fraction used by the ratio retention policy.
+        - retention_topk (int, optional): The row-wise kept block count used by the topk retention policy.
 
         Methods:
         - __init__: Initializes the configuration with user-defined or default values.
@@ -306,6 +315,9 @@ class FastPrefillConfig(dict):
         stride = 16,
         metric = "xattn",
         block_mean_score:bool=False,
+        retention_policy:str="threshold",
+        retention_ratio:float=None,
+        retention_topk:int=None,
     ):
         """
         Initialize the configuration with default or user-provided values.
@@ -315,6 +327,30 @@ class FastPrefillConfig(dict):
         self.metric = metric
         self.stride = stride
         self.block_mean_score = block_mean_score
+        self.retention_policy = retention_policy
+        self.retention_ratio = retention_ratio
+        self.retention_topk = retention_topk
+        if retention_policy not in {"threshold", "ratio", "topk"}:
+            raise ValueError(f"Unsupported retention policy: {retention_policy}")
+        if retention_policy == "ratio":
+            if retention_ratio is None:
+                raise ValueError("retention_ratio must be provided when retention_policy='ratio'")
+            if not 0 <= retention_ratio <= 1:
+                raise ValueError("retention_ratio must be between 0 and 1")
+            if retention_topk is not None:
+                raise ValueError("retention_topk cannot be set when retention_policy='ratio'")
+        elif retention_policy == "topk":
+            if retention_topk is None:
+                raise ValueError("retention_topk must be provided when retention_policy='topk'")
+            if retention_topk < 0:
+                raise ValueError("retention_topk must be non-negative")
+            if retention_ratio is not None:
+                raise ValueError("retention_ratio cannot be set when retention_policy='topk'")
+        else:
+            if retention_ratio is not None:
+                raise ValueError("retention_ratio can only be set when retention_policy='ratio'")
+            if retention_topk is not None:
+                raise ValueError("retention_topk can only be set when retention_policy='topk'")
         if threshold is not None:
             self.threshold = torch.ones((32,32)).to("cuda")*threshold
         else:

@@ -74,6 +74,9 @@ def block_mean_estimate(
     causal=True,
     keep_sink=False,
     keep_recent=False,
+    retention_policy="threshold",
+    retention_ratio=None,
+    retention_topk=None,
 ) -> torch.Tensor:
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
     batch_size, num_q_head, q_len, head_dim = query_states.shape
@@ -120,11 +123,12 @@ def block_mean_estimate(
         simple_mask = find_blocks_chunked(
             attn_sum,
             current_index,
-            threshold,
-            None,
+            threshold if retention_policy == "threshold" else None,
+            retention_topk if retention_policy == "topk" else None,
             decoding=False,
             mode="prefill",
             causal=causal,
+            retention_ratio=retention_ratio if retention_policy == "ratio" else None,
         )
         attn_sum_list.append(attn_sum)
         simple_mask_list.append(simple_mask)
@@ -158,6 +162,9 @@ def xattn_estimate(
     keep_sink=False,
     keep_recent=False,
     block_mean_score=False,
+    retention_policy="threshold",
+    retention_ratio=None,
+    retention_topk=None,
 ) -> torch.Tensor:
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
     batch_size, num_q_head, q_len, head_dim = query_states.shape
@@ -174,6 +181,9 @@ def xattn_estimate(
             causal=causal,
             keep_sink=keep_sink,
             keep_recent=keep_recent,
+            retention_policy=retention_policy,
+            retention_ratio=retention_ratio,
+            retention_topk=retention_topk,
         )
 
     k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
@@ -401,11 +411,12 @@ def xattn_estimate(
         simple_mask = find_blocks_chunked(
             attn_sum,
             k_block_num - q_block_num + chunk_idx * num_blocks_per_chunk,
-            threshold,
-            None,
+            threshold if retention_policy == "threshold" else None,
+            retention_topk if retention_policy == "topk" else None,
             decoding=False,
             mode="prefill",
             causal=causal,
+            retention_ratio=retention_ratio if retention_policy == "ratio" else None,
         )
 
         attn_sum_list.append(attn_sum)
@@ -444,6 +455,9 @@ def Xattention_prefill(
     keep_sink=False,
     keep_recent=False,
     block_mean_score=False,
+    retention_policy="threshold",
+    retention_ratio=None,
+    retention_topk=None,
 ):
     batch_size, num_heads, k_len, head_dim = key_states.shape
     _, _, q_len, _ = query_states.shape
@@ -475,6 +489,9 @@ def Xattention_prefill(
         keep_sink=keep_sink,
         keep_recent=keep_recent,
         block_mean_score=block_mean_score,
+        retention_policy=retention_policy,
+        retention_ratio=retention_ratio,
+        retention_topk=retention_topk,
     )
 
     if query_states.device != key_states.device:
@@ -505,6 +522,7 @@ def Xattention_prefill(
     assert key_states.device == query_states.device
     assert value_states.device == query_states.device
     assert approx_simple_mask.device == query_states.device
+    active_simple_mask = approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous()
 
     attn_output = block_sparse_attn_func(
         query_states,
@@ -514,7 +532,7 @@ def Xattention_prefill(
         k_cu_seq_lens,
         head_mask_type,
         None,
-        approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous(),
+        active_simple_mask,
         q_len,
         k_len,
         p_dropout=0.0,
@@ -528,7 +546,12 @@ def Xattention_prefill(
 
     del query_states
     num_to_compute = (k_block_num + 1) * k_block_num / 2 * num_heads
+    active_attn_sums = attn_sums[:, :, :q_block_num, :k_block_num].to(torch.float32)
+    retained_approx_score = (
+        active_attn_sums * active_simple_mask.to(torch.float32)
+    ).sum() / active_attn_sums.sum().clamp_min(1e-12)
     
     print(f"approximated prefilling Computation: {approx_simple_mask.sum() / num_to_compute}")
+    print(f"retained approximated attention score: {retained_approx_score}")
     del approx_simple_mask, attn_sums
     return attn_output

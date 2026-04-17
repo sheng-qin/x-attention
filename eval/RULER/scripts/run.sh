@@ -83,6 +83,9 @@ PRINT_DETAIL=${PRINT_DETAIL:-""}
 STRIDE=${STRIDE:-""}
 THRESHOLD=${THRESHOLD:-""}
 BLOCK_MEAN_SCORE=${BLOCK_MEAN_SCORE:-""}
+RETENTION_POLICY=${RETENTION_POLICY:-""}
+RETENTION_RATIO=${RETENTION_RATIO:-""}
+RETENTION_TOPK=${RETENTION_TOPK:-""}
 
 shift 2 # Remove MODEL_NAME and BENCHMARK
 while [[ $# -gt 0 ]]; do
@@ -106,6 +109,18 @@ while [[ $# -gt 0 ]]; do
         --block_mean_score)
             BLOCK_MEAN_SCORE="--block_mean_score"
             shift
+            ;;
+        --retention_policy)
+            RETENTION_POLICY="--retention_policy $2"
+            shift 2
+            ;;
+        --retention_ratio)
+            RETENTION_RATIO="--retention_ratio $2"
+            shift 2
+            ;;
+        --retention_topk)
+            RETENTION_TOPK="--retention_topk $2"
+            shift 2
             ;;
         *)
             echo "Unknown option: $1"
@@ -148,6 +163,9 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
     if [[ -n ${STRIDE} ]]; then SETTINGS_INFO+="fuse_${STRIDE##* }_"; fi
     if [[ -n ${THRESHOLD} && -z ${PRECISE_THRESHOLD} ]]; then SETTINGS_INFO+="thresh_${THRESHOLD#--threshold }_"; fi
     if [[ -n ${BLOCK_MEAN_SCORE} ]]; then SETTINGS_INFO+="blockmean_"; fi
+    if [[ -n ${RETENTION_POLICY} && ${RETENTION_POLICY#--retention_policy } != "threshold" ]]; then SETTINGS_INFO+="${RETENTION_POLICY#--retention_policy }_"; fi
+    if [[ -n ${RETENTION_RATIO} ]]; then SETTINGS_INFO+="ratio_${RETENTION_RATIO#--retention_ratio }_"; fi
+    if [[ -n ${RETENTION_TOPK} ]]; then SETTINGS_INFO+="topk_${RETENTION_TOPK#--retention_topk }_"; fi
     
     RESULTS_DIR="${ROOT_DIR}/${SETTINGS_INFO}${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}"
     DATA_DIR="${RESULTS_DIR}/data"
@@ -184,7 +202,10 @@ for MAX_SEQ_LENGTH in "${SEQ_LENGTHS[@]}"; do
             ${THRESHOLD} \
             ${STRIDE} \
             ${PRINT_DETAIL} \
-            ${BLOCK_MEAN_SCORE}
+            ${BLOCK_MEAN_SCORE} \
+            ${RETENTION_POLICY} \
+            ${RETENTION_RATIO} \
+            ${RETENTION_TOPK}
         end_time=$(date +%s)
         time_diff=$((end_time - start_time))
         total_time=$((total_time + time_diff))
