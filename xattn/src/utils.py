@@ -48,9 +48,10 @@ def build_prefill_forced_mask(batch_size, head_num, chunk_num, block_num, curren
     )
     if causal:
         mask[:, :, :, 0] = True
-        mask[:, :, :, current_index : current_index + chunk_num] = torch.eye(
+        diagonal_mask = torch.eye(
             chunk_num, dtype=torch.bool, device=device
-        ).unsqueeze(0).unsqueeze(0).expand(1, head_num, chunk_num, chunk_num)
+        ).unsqueeze(0).unsqueeze(0).expand(batch_size, head_num, chunk_num, chunk_num)
+        mask[:, :, :, current_index : current_index + chunk_num] |= diagonal_mask
     return mask
 
 
